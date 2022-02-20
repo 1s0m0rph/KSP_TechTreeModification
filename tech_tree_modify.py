@@ -13,7 +13,7 @@ modifications file: modifications.json, this structure (small example):
 				"title":"#autoLOC_501020 //#autoLOC_501020 = Basic Rocketry",
 				"description":"#autoLOC_501023 //#autoLOC_501023 = How hard can Rocket Science be anyway?",
 				"cost":5,
-				"hideEmpty":"False",#TODO: what does this do?
+				"hideEmpty":"False",
 				"nodeName":"node1_basicRocketry",
 				"anyToUnlock":"False",#TODO: what does this do?
 				"icon":"RDicon_rocketry-basic",
@@ -98,6 +98,69 @@ modifications file: modifications.json, this structure (small example):
 }
 
 NOTE: the modifications file will generally only define 'new' OR 'old' but not both -- running this script with 'old' defined will revert, running it with 'new' defined will install
+
+some notes on 'pos'
+
+the tech tree is a directed acyclic graph. this means we can be fairly sure that there is at least one good way of drawing it where each layer (layer x is x hops from the 'root' (i.e. the tech node called 'start')) is in a big column. what that means is that we can reduce the difficulty (for the modder) of figuring out a good layout to a much simpler problem (simpler than specifing x/y coords for every damned node): give each node a rank (we'll tell them if they screw up) and just draw the tree in order of rank.
+Here's what the syntax for that will look like:
+
+<mods file>
+{
+"old"
+... (this will preserve the original "pos" field along with everything else)
+
+"new"
+{
+	"tech_tree"
+	{
+		"testNode"
+		{
+			"title": "Test Node",
+			"description": "test... node.",
+			"cost": 500,
+			"icon": "RDicon_test-node",
+			"parents":
+			[
+				{
+					"parentID":"testParent1"
+				},
+				{
+					"parentID":"testParent2"
+				},
+			],
+			"ttm_rank":0,
+			"ttm_layer":5
+		}
+		"testNode2"
+		{
+			"title": "Test Node",
+			"description": "test... node.",
+			"cost": 500,
+			"icon": "RDicon_test-node",
+			"parents":
+			[
+				{
+					"parentID":"testParent2"
+				},
+				{
+					"parentID":"testParent3"
+				},
+			],
+			"ttm_rank":1,
+			"ttm_layer":5
+		}
+	}
+
+	"parts"
+	...
+},
+"pos_strategy":"rank",#auto would run whatever algorithm this script says is best
+}
+
+and we'd see the whole 'ttm_rank' thing (ttm stands for tech-tree modify, btw) and print rank 0 at one end (probably the bottom), then rank 1, then rank 2, and so on.
+
+the template would then also be populating layer for the modder so that they don't screw that part up (hopefully)
+we'll also add a little flag to the top level of the mods file that says whether the user is using this strategy for tree layout
 """
 
 import json
@@ -415,18 +478,87 @@ def generate_nodes_depth(tech_tree):
 	#how far is each node from 'start'
 	return {node:get_node_depth(tech_tree,node) for node in tech_tree}
 
-def generate_nodes_pos(tech_tree,node_depths=None):
-	#TODO improve the loooks of this layout algorithm
-	if node_depths is None:
-		node_depths = generate_nodes_depth(tech_tree)
-
+def auto_generate_nodes_ypos(tech_tree,next_yv_by_depth,ymax,depth_hist,node_depths):
 	#make a version of the tree that's "forwards" (nodes map to lists of their children)
-	forward_tree = {node:[] for node in tech_tree}
+	forward_tree = {node: [] for node in tech_tree}
 	for node in tech_tree:
 		if 'parents' not in tech_tree[node]:
 			continue
 		for par in tech_tree[node]['parents']:
 			forward_tree[par['parentID']].append(node)
+	#now we do a depth-first search through the tree. the first path we traverse goes along the top edge (lowest available y-values), then so on from there
+	stack = ['start']
+	tech_tree['start']['pos'][1] = next_yv_by_depth[0]  #this is normally added on by the parent, but start has no parent, so do it now
+	next_yv_by_depth[0] += ymax/depth_hist[0]  #this shouldn't be necessary -- only 'start' should be at depth 0
+	#we'll use the y-value in tech_tree[node]['pos'] as a 'seen' value
+	while len(stack) > 0:
+		cur = stack.pop(-1)  #take from end
+
+		#y-value is already assigned, just add children to the stack
+		for ch in forward_tree[cur]:
+			#check if seen
+			if tech_tree[ch]['pos'][1] is not None:
+				#seen
+				continue
+			else:
+				#not seen, give y-pos and add to stack
+				stack.append(ch)
+				tech_tree[ch]['pos'][1] = next_yv_by_depth[node_depths[ch]]
+				#move the yv for this depth to the next position
+				next_yv_by_depth[node_depths[ch]] += ymax/depth_hist[node_depths[ch]]
+
+def generate_nodes_ypos_rank(tech_tree,next_yv_by_depth,ymax,depth_hist,node_depths):
+	#use the rank information provided to populate the y-positions
+	#list of dicts (one per layer) mapping rank to node name
+	ranks = [{} for _ in range(len(depth_hist))]
+	#first, verify that the rank info is valid
+	for node in tech_tree:
+		#make sure the layer in the file is correct (not a dealbreaker, since it's only there to help the modder, but they do need to know)
+		if 'ttm_layer' not in tech_tree[node]:
+			warnings.warn("rank y-position mode was requested, but node {} does not define a ttm layer".format(node), SyntaxWarning)
+		elif int(tech_tree[node]['ttm_layer']) != node_depths[node]:
+			warnings.warn("rank y-position mode was requested, but node {} lists {} as its layer;"
+						  " calculated layer for this node is {}"
+						  " (I'm going to ignore the layer defined in the mod file and use the calculated one instead,"
+						  " but your ttm_rank MAY NOT BE WHAT YOU THINK IT IS)"
+						  .format(node,
+								  tech_tree[node]['ttm_layer'],
+								  node_depths[node]),
+						  SyntaxWarning)
+
+		#make sure we have a ttm_tank and that it is unique (doesn't matter if they're all in a row, or even if they're like nonnegative, just need them to be in *an* order)
+		if 'ttm_rank' not in tech_tree[node]:
+			raise ValueError("rank y-position mode was requested, but node {} does not provide a rank".format(node))
+		elif int(tech_tree[node]['ttm_rank']) in ranks[node_depths[node]]:
+			raise ValueError("node {} (layer {}) lists {} as its rank,"
+							 " but another node in this layer ({}) also listed that as its rank (not unique rank)"
+							 .format(node,
+									 node_depths[node],
+									 tech_tree[node]['ttm_rank'],
+									 ranks[node_depths[node]][int(tech_tree[node]['ttm_rank'])]
+									 ))
+		else:
+			ranks[node_depths[node]].update({int(tech_tree[node]['ttm_rank']) : node})
+
+	#everything is verified, cleared to proceed
+	#sort the nodes in each layer according to their rank (ascending or descending doesn't really matter)
+	#flip the ranks dicts (node IDs map to their rank)
+	ranks_flipped = [{d[k]:k for k in d} for d in ranks]
+	layers_sorted_by_rank = [sorted(d.keys(),key=lambda x: d[x]) for d in ranks_flipped]
+
+	#now just go through layer-by-layer and assign yvalues as we go
+	for l in range(0,len(depth_hist)):
+		for node in layers_sorted_by_rank[l]:
+			tech_tree[node]['pos'][1] = next_yv_by_depth[l]
+			#move the yv for this depth to the next position
+			next_yv_by_depth[l] += ymax/depth_hist[l]
+	#modifications done in place, so we're done
+	pass
+
+def generate_nodes_pos(tech_tree,node_depths=None):
+	#TODO improve the loooks of this layout algorithm
+	if node_depths is None:
+		node_depths = generate_nodes_depth(tech_tree)
 
 	#assign x-pos (start = X_MIN, then each node goes by its depth)
 	for node in tech_tree:
@@ -440,30 +572,17 @@ def generate_nodes_pos(tech_tree,node_depths=None):
 	#the widest (y is width here) part will be perfectly dense (implicitly)
 	num_in_widest_depth = max(depth_hist.values())
 	ymax = Y_MIN + (Y_GAP * num_in_widest_depth)
+	next_yv_by_depth = {d: Y_MIN for d in range(num_in_widest_depth)}
 
-	#now we do a depth-first search through the tree. the first path we traverse goes along the top edge (lowest available y-values), then so on from there
-	stack = ['start']
-	next_yv_by_depth = {d:Y_MIN for d in range(num_in_widest_depth)}
-	tech_tree['start']['pos'][1] = next_yv_by_depth[0]#this is normally added on by the parent, but start has no parent, so do it now
-	next_yv_by_depth[0] += ymax / depth_hist[0]#this shouldn't be necessary -- only 'start' should be at depth 0
-	#we'll use the y-value in tech_tree[node]['pos'] as a 'seen' value
-	while len(stack) > 0:
-		cur = stack.pop(-1)#take from end
-
-		#y-value is already assigned, just add children to the stack
-		for ch in forward_tree[cur]:
-			#check if seen
-			if tech_tree[ch]['pos'][1] is not None:
-				#seen
-				continue
-			else:
-				#not seen, give y-pos and add to stack
-				stack.append(ch)
-				tech_tree[ch]['pos'][1] = next_yv_by_depth[node_depths[ch]]
-				#move the yv for this depth to the next position
-				next_yv_by_depth[node_depths[ch]] += ymax / depth_hist[node_depths[ch]]
+	#determine what y-position strategy to use
+	if ('pos_strategy' not in tech_tree) or ('auto' == tech_tree['pos_strategy']):
+		#do the standard one
+		auto_generate_nodes_ypos(tech_tree,next_yv_by_depth,ymax,depth_hist,node_depths)
+	elif 'rank' == tech_tree['pos_strategy']:
+		generate_nodes_ypos_rank(tech_tree,next_yv_by_depth,ymax,depth_hist,node_depths)
 
 	#all of the modifications were done in-place, so we are done
+	pass
 	
 def auto_populate_missing_fields(tree_mods):
 	#only touches certain fields:
@@ -526,7 +645,7 @@ def apply_tree_modifications(tree_mods,tree_path):
 				if MODIFIERS_PARENTS_LIST_KEY == field:
 					continue#parents should come last
 				else:
-					if 'pos' == field:
+					if ('pos' == field) and (str != type(field)):
 						f.write('\t\t{} = {},{},{}\n'.format(field,*tree_mods[rdnode][field]))
 					else:
 						f.write('\t\t{} = {}\n'.format(field,tree_mods[rdnode][field]))
@@ -630,9 +749,14 @@ if __name__ == '__main__':
 	if 'template' == action:
 		#don't load the json from the file given
 		#throw away any fields which we would auto-populate anyway (at best they confuse the user)
+		#precompute node depths
+		node_depths = generate_nodes_depth(current_tech_tree)
 		new_tech_tree = {}
 		for tech in current_tech_tree:
 			new_tech_tree.update({tech:{field:current_tech_tree[tech][field] for field in current_tech_tree[tech] if (field not in tree_auto_fields) and ('parents' != field)}})
+			#add in fields for ttm_layer (calculated) and ttm_rank (blank
+			new_tech_tree[tech].update({'ttm_layer':node_depths[tech],
+										'ttm_rank':"TODO"})
 			if 'parents' in current_tech_tree[tech]:
 				new_tech_tree[tech].update({'parents':[
 					{field:current_tech_tree[tech]['parents'][i][field] for field in current_tech_tree[tech]['parents'][i] if field not in tree_parent_auto_fields}
@@ -641,12 +765,13 @@ if __name__ == '__main__':
 		current_tech_tree = new_tech_tree
 
 		#format the dict we're going to throw into the mod file
-		modf_data = {'old':{'tech_tree':{},'parts':{}},
+		modf_data = {'pos_strategy':'rank',
+					 'old':{'tech_tree':{},'parts':{}},
 					 'new':{'tech_tree':{},'parts':{}}}
 		#put the stuff we just read into 'new'
 		modf_data['new']['tech_tree'] = current_tech_tree
 		modf_data['new']['parts'] = current_parts
-		
+
 		#output the data and exit normally
 		output_modifications(modf_data,mod_file)
 		exit(0)
